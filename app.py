@@ -5,7 +5,7 @@ import tempfile, subprocess, shutil, requests
 
 st.set_page_config(page_title='TRIPICK AI', page_icon='✈️', layout='wide')
 st.title('✈️ TRIPICK AI')
-st.caption('사진 → 움직이는 세로 여행영상 → ElevenLabs 한국어 나레이션 → 제휴 게시글 · v2.3')
+st.caption('사진 → 움직이는 세로 여행영상 → ElevenLabs 한국어 나레이션 → 제휴 게시글 · v2.4')
 
 AFFILIATES = {
     '쿠팡 파트너스': '[광고] 이 포스팅은 쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받습니다.',
@@ -78,9 +78,6 @@ if voices:
     voice_choice = st.sidebar.selectbox("ElevenLabs 실제 목소리", names, index=0)
     selected_voice = by_name[voice_choice]
     st.caption(f"🎧 ElevenLabs 선택 목소리: {selected_voice.get('name','Voice')}")
-    preview = selected_voice.get("preview_url")
-    if preview:
-        st.audio(preview, format="audio/mpeg")
 else:
     st.sidebar.caption("ElevenLabs 목소리 목록을 불러오면 실제 성우 선택칸이 나타납니다.")
     if not api_key:
@@ -103,6 +100,8 @@ def resolved_voice_style():
 selected_voice_style = resolved_voice_style()
 st.caption(f"🎚️ 말투 설정: {selected_voice_style}" + (' (자동 추천)' if voice_style == '자동 추천' else ''))
 
+PREVIEW_TEXT = "탁 트인 풍경과 여유로운 공간, 다음 여행은 여기 어떠세요?"
+
 def make_tts(text, out_path, voice_id, style, api_key):
     settings = VOICE_SETTINGS[style]
     url = f"{ELEVEN_API}/text-to-speech/{voice_id}"
@@ -123,6 +122,21 @@ def make_tts(text, out_path, voice_id, style, api_key):
         except Exception: detail = r.text
         raise RuntimeError(f"ElevenLabs {r.status_code}: {str(detail)[:500]}")
     out_path.write_bytes(r.content)
+
+if selected_voice and api_key:
+    st.caption("🇰🇷 모든 성우는 같은 짧은 한국어 문장으로 비교합니다. 미리듣기 생성 시 ElevenLabs 크레딧이 소량 사용됩니다.")
+    if st.button("▶ 선택 성우 한국어 미리듣기", use_container_width=False):
+        preview_dir = Path(tempfile.mkdtemp(prefix='tripick_preview_'))
+        try:
+            preview_path = preview_dir / 'preview.mp3'
+            with st.spinner('선택한 성우의 한국어 미리듣기를 만드는 중이에요…'):
+                make_tts(PREVIEW_TEXT, preview_path, selected_voice['voice_id'], selected_voice_style, api_key)
+            st.audio(preview_path.read_bytes(), format='audio/mpeg')
+            st.caption(f"미리듣기 문장: {PREVIEW_TEXT}")
+        except Exception as e:
+            st.error(f"한국어 미리듣기 생성 실패: {type(e).__name__}: {e}")
+        finally:
+            shutil.rmtree(preview_dir, ignore_errors=True)
 
 def run(cmd, timeout=180):
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
