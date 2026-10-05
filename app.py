@@ -5,7 +5,7 @@ import tempfile, subprocess, shutil, requests
 
 st.set_page_config(page_title='TRIPICK AI', page_icon='✈️', layout='wide')
 st.title('✈️ TRIPICK AI')
-st.caption('사진 → 움직이는 세로 여행영상 → ElevenLabs 한국어 나레이션 → 제휴 게시글 · v2.4')
+st.caption('사진 → 움직이는 세로 여행영상 → ElevenLabs / Typecast 한국어 나레이션 → 제휴 게시글 · v2.5')
 
 AFFILIATES = {
     '쿠팡 파트너스': '[광고] 이 포스팅은 쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받습니다.',
@@ -26,9 +26,10 @@ with st.sidebar:
     affiliate = st.selectbox('제휴처', list(AFFILIATES.keys()))
     channel = st.selectbox('게시 채널', ['인스타 릴스', '틱톡', '유튜브 쇼츠', '네이버 블로그'])
     motion = st.selectbox('영상 움직임', ['부드러운 줌 + 좌우 패닝', '줌 중심'], index=0)
-    voice_style = st.selectbox('나레이션 목소리', ['자동 추천', '일상적인', '부드러운', '밝은', '차분한', '활기찬'], index=0)
+    tts_engine = st.selectbox('음성 엔진', ['ElevenLabs', 'Typecast'], index=0)
+    voice_style = st.selectbox('나레이션 말투', ['자동 추천', '일상적인', '부드러운', '밝은', '차분한', '활기찬'], index=0)
     st.caption('출력: 720×1280 MP4 (세로 9:16)')
-    st.info('ElevenLabs 실제 목소리를 선택해 한국어 나레이션을 만들어요. Artlist 크레딧은 사용하지 않습니다.')
+    st.info('ElevenLabs 또는 Typecast 실제 목소리를 선택해 한국어 나레이션을 만들어요. Artlist 크레딧은 사용하지 않습니다.')
 
 files = st.file_uploader('숙소 사진을 순서대로 올려주세요 (최대 14장)', type=['jpg','jpeg','png','webp'], accept_multiple_files=True)
 script = st.text_area('🎙️ 나레이션 문구', value=DEFAULT_SCRIPT, height=150)
@@ -45,6 +46,49 @@ def eleven_key():
     except Exception:
         return None
 
+TYPECAST_API = "https://api.typecast.ai"
+
+def typecast_key():
+    try:
+        return st.secrets["TYPECAST_API_KEY"]
+    except Exception:
+        return None
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_typecast_voices(api_key):
+    headers={"X-API-KEY": api_key}
+    # Typecast v3 voice list supports metadata filters; keep parsing tolerant to API response wrappers.
+    r=requests.get(f"{TYPECAST_API}/v3/voices", headers=headers, params={"gender":"female","model":"ssfm-v30"}, timeout=25)
+    r.raise_for_status()
+    data=r.json()
+    if isinstance(data, list): voices=data
+    elif isinstance(data, dict):
+        voices=data.get("voices") or data.get("items") or data.get("data") or data.get("results") or []
+        if isinstance(voices, dict): voices=voices.get("voices") or voices.get("items") or []
+    else: voices=[]
+    # Double-check female label when metadata exists, but don't discard entries with sparse metadata.
+    out=[]
+    for v in voices:
+        if not isinstance(v,dict): continue
+        gender=str(v.get("gender") or (v.get("labels") or {}).get("gender") or "").lower()
+        if gender in ("", "female", "woman", "f"): out.append(v)
+    return sorted(out, key=lambda v: str(v.get("name") or v.get("display_name") or "").lower())
+
+def make_typecast_tts(text, out_path, voice_id, style, api_key):
+    emotion={"일상적인":"smart","부드러운":"smart","밝은":"happy","차분한":"smart","활기찬":"happy"}.get(style,"smart")
+    tempo={"일상적인":1.00,"부드러운":0.96,"밝은":1.04,"차분한":0.94,"활기찬":1.06}.get(style,1.0)
+    payload={
+        "voice_id":voice_id, "text":text, "model":"ssfm-v30",
+        "prompt":{"emotion_type":emotion},
+        "output":{"volume":100,"audio_pitch":0,"audio_tempo":tempo,"audio_format":"wav"}
+    }
+    r=requests.post(f"{TYPECAST_API}/v1/text-to-speech", headers={"X-API-KEY":api_key,"Content-Type":"application/json","Accept":"audio/wav"}, json=payload, timeout=90)
+    if r.status_code >= 400:
+        try: detail=r.json()
+        except Exception: detail=r.text
+        raise RuntimeError(f"Typecast {r.status_code}: {str(detail)[:500]}")
+    out_path.write_bytes(r.content)
+
 @st.cache_data(ttl=600, show_spinner=False)
 def load_eleven_voices(api_key):
     r = requests.get(f"{ELEVEN_API}/voices", headers={"xi-api-key": api_key}, timeout=20)
@@ -55,33 +99,37 @@ def load_eleven_voices(api_key):
     pool = female or voices
     return sorted(pool, key=lambda v: (v.get("name") or "").lower())
 
-api_key = eleven_key()
-voices = []
-selected_voice = None
-if api_key:
-    try:
-        voices = load_eleven_voices(api_key)
-    except Exception as e:
-        st.warning(f"ElevenLabs 목소리 목록을 불러오지 못했어요: {type(e).__name__}")
+eleven_api_key = eleven_key()
+typecast_api_key = typecast_key()
+voices=[]
+selected_voice=None
+active_api_key = eleven_api_key if tts_engine == 'ElevenLabs' else typecast_api_key
+
+try:
+    if tts_engine == 'ElevenLabs' and eleven_api_key:
+        voices=load_eleven_voices(eleven_api_key)
+    elif tts_engine == 'Typecast' and typecast_api_key:
+        voices=load_typecast_voices(typecast_api_key)
+except Exception as e:
+    st.warning(f"{tts_engine} 목소리 목록을 불러오지 못했어요: {type(e).__name__}: {e}")
 
 if voices:
-    names = []
-    by_name = {}
+    names=[]; by_name={}
     for v in voices:
-        labels = v.get("labels") or {}
-        desc = labels.get("description") or labels.get("use_case") or labels.get("age") or ""
-        label = f"{v.get('name','Voice')}" + (f" · {desc}" if desc else "")
-        # Keep labels unique even when voice names collide.
-        if label in by_name:
-            label += f" · {v.get('voice_id','')[:6]}"
-        names.append(label); by_name[label] = v
-    voice_choice = st.sidebar.selectbox("ElevenLabs 실제 목소리", names, index=0)
-    selected_voice = by_name[voice_choice]
-    st.caption(f"🎧 ElevenLabs 선택 목소리: {selected_voice.get('name','Voice')}")
+        labels=v.get('labels') or {}
+        name=v.get('name') or v.get('display_name') or 'Voice'
+        desc=labels.get('description') or labels.get('use_case') or v.get('use_case') or v.get('age') or labels.get('age') or ''
+        vid=v.get('voice_id') or v.get('id') or ''
+        label=f"{name}" + (f" · {desc}" if desc else '')
+        if label in by_name: label += f" · {str(vid)[:6]}"
+        names.append(label); by_name[label]=v
+    voice_choice=st.sidebar.selectbox(f"{tts_engine} 실제 목소리", names, index=0)
+    selected_voice=by_name[voice_choice]
+    st.caption(f"🎧 {tts_engine} 선택 목소리: {selected_voice.get('name') or selected_voice.get('display_name') or 'Voice'}")
 else:
-    st.sidebar.caption("ElevenLabs 목소리 목록을 불러오면 실제 성우 선택칸이 나타납니다.")
-    if not api_key:
-        st.warning("Streamlit 비밀에 ELEVENLABS_API_KEY가 없습니다. 앱 설정 → 비밀에서 키를 저장해 주세요.")
+    st.sidebar.caption(f"{tts_engine} 목소리 목록을 불러오면 실제 성우 선택칸이 나타납니다.")
+    if not active_api_key:
+        st.warning(f"Streamlit 비밀에 {'ELEVENLABS_API_KEY' if tts_engine=='ElevenLabs' else 'TYPECAST_API_KEY'}가 없습니다.")
 
 VOICE_SETTINGS = {
     '일상적인': {'stability': 0.45, 'similarity_boost': 0.78, 'style': 0.15},
@@ -123,15 +171,22 @@ def make_tts(text, out_path, voice_id, style, api_key):
         raise RuntimeError(f"ElevenLabs {r.status_code}: {str(detail)[:500]}")
     out_path.write_bytes(r.content)
 
-if selected_voice and api_key:
-    st.caption("🇰🇷 모든 성우는 같은 짧은 한국어 문장으로 비교합니다. 미리듣기 생성 시 ElevenLabs 크레딧이 소량 사용됩니다.")
+if selected_voice and active_api_key:
+    st.caption(f"🇰🇷 모든 성우는 같은 짧은 한국어 문장으로 비교합니다. 미리듣기 생성 시 {tts_engine} 크레딧이 소량 사용됩니다.")
     if st.button("▶ 선택 성우 한국어 미리듣기", use_container_width=False):
         preview_dir = Path(tempfile.mkdtemp(prefix='tripick_preview_'))
         try:
             preview_path = preview_dir / 'preview.mp3'
             with st.spinner('선택한 성우의 한국어 미리듣기를 만드는 중이에요…'):
-                make_tts(PREVIEW_TEXT, preview_path, selected_voice['voice_id'], selected_voice_style, api_key)
-            st.audio(preview_path.read_bytes(), format='audio/mpeg')
+                vid=selected_voice.get('voice_id') or selected_voice.get('id')
+                if tts_engine == 'ElevenLabs':
+                    make_tts(PREVIEW_TEXT, preview_path, vid, selected_voice_style, active_api_key)
+                    audio_format='audio/mpeg'
+                else:
+                    preview_path=preview_dir/'preview.wav'
+                    make_typecast_tts(PREVIEW_TEXT, preview_path, vid, selected_voice_style, active_api_key)
+                    audio_format='audio/wav'
+            st.audio(preview_path.read_bytes(), format=audio_format)
             st.caption(f"미리듣기 문장: {PREVIEW_TEXT}")
         except Exception as e:
             st.error(f"한국어 미리듣기 생성 실패: {type(e).__name__}: {e}")
@@ -149,11 +204,11 @@ if files:
         with cols[i % 5]: st.image(f, caption=f'{i+1}. {f.name}', use_container_width=True)
     st.caption('권장 순서: 전경 → 외관 → 야외 → 거실/주방 → 침실 → 욕실 → 수영장/스파 → 마무리')
 
-    if st.button('🎬 ElevenLabs 음성 포함 영상 만들기', type='primary', use_container_width=True):
+    if st.button(f'🎬 {tts_engine} 음성 포함 영상 만들기', type='primary', use_container_width=True):
         work = Path(tempfile.mkdtemp(prefix='tripick_'))
         try:
-            if not api_key or not selected_voice:
-                st.error('ElevenLabs 연결 또는 목소리 선택을 먼저 확인해 주세요.')
+            if not active_api_key or not selected_voice:
+                st.error(f'{tts_engine} 연결 또는 목소리 선택을 먼저 확인해 주세요.')
                 st.stop()
             W,H,FPS = 720,1280,24
             n=len(files); trans=0.35
@@ -202,11 +257,13 @@ if files:
                 st.stop()
 
             final=work/'TRIPICK_travel_short_voice.mp4'
-            voice=work/'voice.mp3'
+            voice=work/('voice.mp3' if tts_engine=='ElevenLabs' else 'voice.wav')
             voice_ok=False
             try:
                 with st.spinner('한국어 여성 나레이션을 만드는 중이에요…'):
-                    make_tts(script, voice, selected_voice['voice_id'], selected_voice_style, api_key)
+                    vid=selected_voice.get('voice_id') or selected_voice.get('id')
+                    if tts_engine == 'ElevenLabs': make_tts(script, voice, vid, selected_voice_style, active_api_key)
+                    else: make_typecast_tts(script, voice, vid, selected_voice_style, active_api_key)
                 # Fit narration to the selected video duration only if it is too long.
                 probe=run(['ffprobe','-v','error','-show_entries','format=duration','-of','default=noprint_wrappers=1:nokey=1',str(voice)],30)
                 vd=float(probe.stdout.strip() or '0')
@@ -223,7 +280,7 @@ if files:
 
             chosen = final if voice_ok else silent
             data=chosen.read_bytes()
-            st.success('완성! 움직이는 여행영상' + (f" + {selected_voice.get('name','ElevenLabs')} 나레이션" if voice_ok else ' (무음)'))
+            st.success('완성! 움직이는 여행영상' + (f" + {tts_engine} {selected_voice.get('name') or selected_voice.get('display_name') or 'Voice'} 나레이션" if voice_ok else ' (무음)'))
             st.video(data)
             st.download_button('⬇️ MP4 저장',data=data,file_name='TRIPICK_travel_short.mp4',mime='video/mp4',use_container_width=True)
             if not voice_ok:
