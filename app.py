@@ -1,11 +1,11 @@
 import streamlit as st
 from PIL import Image
 from pathlib import Path
-import tempfile, subprocess, shutil, html, asyncio
+import tempfile, subprocess, shutil, requests
 
 st.set_page_config(page_title='TRIPICK AI', page_icon='✈️', layout='wide')
 st.title('✈️ TRIPICK AI')
-st.caption('사진 → 움직이는 세로 여행영상 → 한국어 여성 나레이션 → 제휴 게시글 · v2.2')
+st.caption('사진 → 움직이는 세로 여행영상 → ElevenLabs 한국어 나레이션 → 제휴 게시글 · v2.3')
 
 AFFILIATES = {
     '쿠팡 파트너스': '[광고] 이 포스팅은 쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받습니다.',
@@ -28,7 +28,7 @@ with st.sidebar:
     motion = st.selectbox('영상 움직임', ['부드러운 줌 + 좌우 패닝', '줌 중심'], index=0)
     voice_style = st.selectbox('나레이션 목소리', ['자동 추천', '일상적인', '부드러운', '밝은', '차분한', '활기찬'], index=0)
     st.caption('출력: 720×1280 MP4 (세로 9:16)')
-    st.info('Artlist 크레딧 없이 한국어 여성 TTS를 사용합니다. 목소리 느낌을 선택하고 미리 들을 수 있어요.')
+    st.info('ElevenLabs 실제 목소리를 선택해 한국어 나레이션을 만들어요. Artlist 크레딧은 사용하지 않습니다.')
 
 files = st.file_uploader('숙소 사진을 순서대로 올려주세요 (최대 14장)', type=['jpg','jpeg','png','webp'], accept_multiple_files=True)
 script = st.text_area('🎙️ 나레이션 문구', value=DEFAULT_SCRIPT, height=150)
@@ -37,36 +37,92 @@ st.subheader('📝 게시글')
 caption = f'''{AFFILIATES[affiliate]}\n\n탁 트인 풍경부터 수영장과 스파까지 🌿\n여유롭게 쉬어가기 좋은 숙소예요.\n\n📌 다음 여행을 위해 저장해두세요.\n💌 숙소 정보가 궁금하다면 DM으로 ‘숙소’라고 보내주세요.\n\n#숙소추천 #여행추천 #감성숙소 #국내여행 #트리픽'''
 st.text_area('복사해서 게시하세요', value=caption, height=220)
 
-VOICE_PRESETS = {
-    '일상적인': {'rate': '+8%', 'pitch': '+0Hz', 'preview_rate': 1.08, 'preview_pitch': 1.02},
-    '부드러운': {'rate': '-3%', 'pitch': '-2Hz', 'preview_rate': 0.96, 'preview_pitch': 0.98},
-    '밝은': {'rate': '+10%', 'pitch': '+4Hz', 'preview_rate': 1.10, 'preview_pitch': 1.08},
-    '차분한': {'rate': '-8%', 'pitch': '-4Hz', 'preview_rate': 0.92, 'preview_pitch': 0.95},
-    '활기찬': {'rate': '+15%', 'pitch': '+6Hz', 'preview_rate': 1.15, 'preview_pitch': 1.10},
+ELEVEN_API = "https://api.elevenlabs.io/v1"
+
+def eleven_key():
+    try:
+        return st.secrets["ELEVENLABS_API_KEY"]
+    except Exception:
+        return None
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_eleven_voices(api_key):
+    r = requests.get(f"{ELEVEN_API}/voices", headers={"xi-api-key": api_key}, timeout=20)
+    r.raise_for_status()
+    voices = r.json().get("voices", [])
+    # Prefer voices explicitly labelled female. If labels are sparse, keep all so the user can still choose.
+    female = [v for v in voices if str((v.get("labels") or {}).get("gender", "")).lower() == "female"]
+    pool = female or voices
+    return sorted(pool, key=lambda v: (v.get("name") or "").lower())
+
+api_key = eleven_key()
+voices = []
+selected_voice = None
+if api_key:
+    try:
+        voices = load_eleven_voices(api_key)
+    except Exception as e:
+        st.warning(f"ElevenLabs 목소리 목록을 불러오지 못했어요: {type(e).__name__}")
+
+if voices:
+    names = []
+    by_name = {}
+    for v in voices:
+        labels = v.get("labels") or {}
+        desc = labels.get("description") or labels.get("use_case") or labels.get("age") or ""
+        label = f"{v.get('name','Voice')}" + (f" · {desc}" if desc else "")
+        # Keep labels unique even when voice names collide.
+        if label in by_name:
+            label += f" · {v.get('voice_id','')[:6]}"
+        names.append(label); by_name[label] = v
+    voice_choice = st.sidebar.selectbox("ElevenLabs 실제 목소리", names, index=0)
+    selected_voice = by_name[voice_choice]
+    st.caption(f"🎧 ElevenLabs 선택 목소리: {selected_voice.get('name','Voice')}")
+    preview = selected_voice.get("preview_url")
+    if preview:
+        st.audio(preview, format="audio/mpeg")
+else:
+    st.sidebar.caption("ElevenLabs 목소리 목록을 불러오면 실제 성우 선택칸이 나타납니다.")
+    if not api_key:
+        st.warning("Streamlit 비밀에 ELEVENLABS_API_KEY가 없습니다. 앱 설정 → 비밀에서 키를 저장해 주세요.")
+
+VOICE_SETTINGS = {
+    '일상적인': {'stability': 0.45, 'similarity_boost': 0.78, 'style': 0.15},
+    '부드러운': {'stability': 0.58, 'similarity_boost': 0.78, 'style': 0.10},
+    '밝은': {'stability': 0.38, 'similarity_boost': 0.76, 'style': 0.32},
+    '차분한': {'stability': 0.68, 'similarity_boost': 0.80, 'style': 0.08},
+    '활기찬': {'stability': 0.32, 'similarity_boost': 0.75, 'style': 0.42},
 }
 
 def resolved_voice_style():
-    if voice_style != '자동 추천':
-        return voice_style
-    # v2.2의 자동 추천은 채널/길이에 맞춘 안전한 기본 추천입니다.
-    if channel in ['틱톡', '유튜브 쇼츠'] or duration == 15:
-        return '밝은'
-    if duration == 30:
-        return '차분한'
+    if voice_style != '자동 추천': return voice_style
+    if channel in ['틱톡', '유튜브 쇼츠'] or duration == 15: return '밝은'
+    if duration == 30: return '차분한'
     return '일상적인'
 
-selected_voice = resolved_voice_style()
-vp = VOICE_PRESETS[selected_voice]
-st.caption(f'🎧 적용 목소리: {selected_voice}' + (' (자동 추천)' if voice_style == '자동 추천' else ''))
-spoken = html.escape(script).replace('`','')
-voice_html = f'''<div style="display:flex;gap:8px;align-items:center;margin:4px 0 16px 0"><button onclick="tripickSpeak()" style="padding:10px 16px;border:0;border-radius:8px;background:#111827;color:white;cursor:pointer">▶ {selected_voice} 미리듣기</button><button onclick="window.speechSynthesis.cancel()" style="padding:10px 16px;border:1px solid #bbb;border-radius:8px;background:white;cursor:pointer">■ 정지</button></div><script>function tripickSpeak(){{window.speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(`{spoken}`);u.lang='ko-KR';u.rate={vp['preview_rate']};u.pitch={vp['preview_pitch']};const voices=window.speechSynthesis.getVoices();const ko=voices.filter(v=>(v.lang||'').toLowerCase().startsWith('ko'));u.voice=ko.find(v=>['female','sunhi','yuna','heami','sora','seoyeon'].some(h=>v.name.toLowerCase().includes(h)))||ko[0]||null;window.speechSynthesis.speak(u);}}</script>'''
-st.components.v1.html(voice_html, height=60)
+selected_voice_style = resolved_voice_style()
+st.caption(f"🎚️ 말투 설정: {selected_voice_style}" + (' (자동 추천)' if voice_style == '자동 추천' else ''))
 
-async def make_tts(text, out_path, style):
-    import edge_tts
-    preset = VOICE_PRESETS[style]
-    communicate = edge_tts.Communicate(text, 'ko-KR-SunHiNeural', rate=preset['rate'], pitch=preset['pitch'])
-    await communicate.save(str(out_path))
+def make_tts(text, out_path, voice_id, style, api_key):
+    settings = VOICE_SETTINGS[style]
+    url = f"{ELEVEN_API}/text-to-speech/{voice_id}"
+    params = {"output_format": "mp3_44100_128"}
+    payload = {
+        "text": text,
+        "model_id": "eleven_multilingual_v2",
+        "voice_settings": {
+            "stability": settings['stability'],
+            "similarity_boost": settings['similarity_boost'],
+            "style": settings['style'],
+            "use_speaker_boost": True,
+        },
+    }
+    r = requests.post(url, params=params, headers={"xi-api-key": api_key, "Content-Type": "application/json", "Accept": "audio/mpeg"}, json=payload, timeout=90)
+    if r.status_code >= 400:
+        try: detail = r.json().get("detail", r.text)
+        except Exception: detail = r.text
+        raise RuntimeError(f"ElevenLabs {r.status_code}: {str(detail)[:500]}")
+    out_path.write_bytes(r.content)
 
 def run(cmd, timeout=180):
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
@@ -79,9 +135,12 @@ if files:
         with cols[i % 5]: st.image(f, caption=f'{i+1}. {f.name}', use_container_width=True)
     st.caption('권장 순서: 전경 → 외관 → 야외 → 거실/주방 → 침실 → 욕실 → 수영장/스파 → 마무리')
 
-    if st.button('🎬 음성 포함 영상 만들기', type='primary', use_container_width=True):
+    if st.button('🎬 ElevenLabs 음성 포함 영상 만들기', type='primary', use_container_width=True):
         work = Path(tempfile.mkdtemp(prefix='tripick_'))
         try:
+            if not api_key or not selected_voice:
+                st.error('ElevenLabs 연결 또는 목소리 선택을 먼저 확인해 주세요.')
+                st.stop()
             W,H,FPS = 720,1280,24
             n=len(files); trans=0.35
             clip = duration/n + trans
@@ -133,7 +192,7 @@ if files:
             voice_ok=False
             try:
                 with st.spinner('한국어 여성 나레이션을 만드는 중이에요…'):
-                    asyncio.run(make_tts(script, voice, selected_voice))
+                    make_tts(script, voice, selected_voice['voice_id'], selected_voice_style, api_key)
                 # Fit narration to the selected video duration only if it is too long.
                 probe=run(['ffprobe','-v','error','-show_entries','format=duration','-of','default=noprint_wrappers=1:nokey=1',str(voice)],30)
                 vd=float(probe.stdout.strip() or '0')
@@ -150,7 +209,7 @@ if files:
 
             chosen = final if voice_ok else silent
             data=chosen.read_bytes()
-            st.success('완성! 움직이는 여행영상' + (f' + {selected_voice} 여성 나레이션' if voice_ok else ' (무음)'))
+            st.success('완성! 움직이는 여행영상' + (f" + {selected_voice.get('name','ElevenLabs')} 나레이션" if voice_ok else ' (무음)'))
             st.video(data)
             st.download_button('⬇️ MP4 저장',data=data,file_name='TRIPICK_travel_short.mp4',mime='video/mp4',use_container_width=True)
             if not voice_ok:
